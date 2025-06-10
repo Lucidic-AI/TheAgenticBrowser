@@ -16,6 +16,10 @@ from core.utils.message_type import MessageType
 from core.utils.openai_msg_parser import AgentConversationHandler, ConversationStorage
 from core.utils.custom_exceptions import CustomException, PlannerError, BrowserNavigationError, SSAnalysisError, CritiqueError
 
+import lucidicai as lai
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
 tokenizer = tiktoken.encoding_for_model("gpt-4o")
 
@@ -286,6 +290,15 @@ class Orchestrator:
         if start_url and start_url != self.current_url:
             await self.navigate_to_url(start_url)
 
+        lai.init(
+            "The Agentic Browser",
+            task=command,
+            # agent_id=os.getenv("LUCIDIC_AGENT_ID"), -> This is grabbed automatically from env
+            # lucidic_api_key=os.getenv("LUCIDIC_API_KEY") -> This is grabbed automatically from env
+            provider="openai",
+            # mass_sim_id=<FILL THIS IN> -> include this if this session should be part of a mass simulation 
+        )
+
         try:
             logfire.info(f" Running Loop with User Query: {command}")
             await self.notify_client(f"Executing command: {command}", MessageType.INFO)
@@ -310,6 +323,9 @@ class Orchestrator:
             self.iteration_counter = 0
             while not self.terminate:
                 try:
+                    # Create a new Lucidic step
+                    lai.create_step()
+
                     self.iteration_counter += 1
                     logfire.debug(f"________Iteration {self.iteration_counter}________") 
                     logfire.info("Running planner agent")
@@ -317,12 +333,19 @@ class Orchestrator:
 
                     # Planner Execution
                     try:
+                        # Create a new Lucidic event to track Planner agent call
+                        lai.create_event(
+                            description=prompt_constructor(PA_prompt),
+                        )
                         validated_history = ensure_tool_response_sequence(self.message_histories['planner'])
                         planner_response = await PA_agent.run(
                             user_prompt=prompt_constructor(PA_prompt),
                             message_history=validated_history
                         )
                         self.conversation_handler.add_planner_message(planner_response)
+                        
+                        # Update event with result
+                        lai.end_event(result=planner_response.all_messages_json().decode('utf-8'))
 
                         # Update planner's message history
                         self.message_histories['planner'].extend(planner_response.new_messages())
@@ -334,6 +357,12 @@ class Orchestrator:
                         logfire.info(f"Current step : {c_step}")
                         await self.notify_client(f"Plan Generated: {plan}", MessageType.INFO)
                         await self.notify_client(f"Current Step: {c_step}", MessageType.INFO)
+
+                        # Update step with plan and current step
+                        lai.update_step(
+                            state=c_step,
+                            goal=plan
+                        )
 
                         try:
                             if self.iteration_counter == 1:  # Only show plan on first iteration
@@ -414,6 +443,10 @@ class Orchestrator:
                     try:
                         logfire.info("Running browser agent")
 
+                        # Create new Lucidic event to track Browser agent call
+                        lai.create_event(
+                            description=prompt_constructor(BA_prompt),
+                        )
                         history = filter_dom_messages(self.message_histories['browser'])
                         browser_response = await BA_agent.run(
                             user_prompt=prompt_constructor(BA_prompt),
@@ -422,6 +455,9 @@ class Orchestrator:
                             # deps=self.browser_manager
                         )
                         self.conversation_handler.add_browser_nav_message(browser_response)
+
+                        # Update event with result
+                        lai.end_event(result=browser_response.all_messages_json().decode('utf-8'))
 
                         # Extract new messages and get tool interactions
                         new_messages = browser_response.new_messages()
@@ -433,7 +469,10 @@ class Orchestrator:
                         logfire.info(f"All Messages from Browser Agent: {browser_response.all_messages()}")
                         logfire.info(f"Tool Interactions: {tool_interactions_str}")
                         
-                        
+                        # Update step to include action
+                        lai.update_step(
+                            action=tool_interactions_str
+                        )
 
                         
 
@@ -499,7 +538,7 @@ class Orchestrator:
                         try:
                             logfire.info("Running SS analysis")
                             
-                            
+                            # This gets captured automatically by the Lucidic OpenAI Handler
                             ss_analysis_response = ImageAnalyzer(
                                 pre_action_ss, 
                                 post_action_ss, 
@@ -535,11 +574,18 @@ class Orchestrator:
                             f'browser_error="{browser_error if browser_error else "None"}"'
                         )
 
+                        # Create new Lucidic event to track Critique agent call
+                        lai.create_event(
+                            description=prompt_constructor(CA_prompt),
+                        )
                         critique_response = await CA_agent.run(
                             user_prompt=prompt_constructor(CA_prompt),
                             message_history=self.message_histories['critique']
                         )
                         self.conversation_handler.add_critique_message(critique_response)
+
+                        # Update event with result
+                        lai.end_event(result=critique_response.all_messages_json().decode('utf-8'))
 
                         # Update critique's message history
                         self.message_histories['critique'].extend(critique_response.new_messages())
@@ -613,6 +659,11 @@ class Orchestrator:
                     )
                     # Optionally retry or continue to next iteration
                     continue
+                
+                finally:
+                    lai.end_step(
+                        screenshot_path=post_action_ss,
+                    )
 
         except Exception as e:
             error_msg = f"Critical Error in orchestrator: {str(e)}"
@@ -627,6 +678,7 @@ class Orchestrator:
 
         finally:
             logfire.info("Orchestrator Execution Completed")
+            lai.reset()
             await self.cleanup()
 
     async def start(self):
